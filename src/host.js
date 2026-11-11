@@ -13,7 +13,7 @@ import { readFileSync, existsSync, writeFileSync, unlinkSync, statSync, mkdirSyn
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
-import { loadConfig, saveConfig, publicConfig, mergeFromPanel } from './core/config.js'
+import { loadConfig, saveConfig, publicConfig, mergeFromPanel, persistExternalSecret } from './core/config.js'
 import { createLogger } from './core/logger.js'
 import { registerSecret, redact } from './core/redact.js'
 import { createOneBotClient } from './onebot/client.js'
@@ -26,7 +26,7 @@ import { mimeOf } from './chat/inbound.js'
 import { dataDir, ensureDir } from './core/store.js'
 import { createUpdateChecker, changelogSection } from './core/update.js'
 import { parseCommand, runCommand, createMutes, commandList } from './chat/commands.js'
-import { listPersonas, readPersona, savePersona, deletePersona, currentPersonaText, rulesText, seedPersonas } from './persona/personas.js'
+import { listPersonas, readPersona, savePersona, deletePersona, currentPersonaText, rulesText, seedPersonas, resolvePersonaId, todayPersona } from './persona/personas.js'
 import { createModules, API_VERSION } from './core/modules.js'
 import { createBridge } from './core/bridge.js'
 import { BUILTINS } from './modules/index.js'
@@ -66,7 +66,7 @@ export function apply(ctx) {
   const rulesOpts = (kind) => (mods ? { off: mods.builtinOff(), extra: mods.rules(kind) } : {})
   // 扩展模块能整段改写人格和规则（同步：提示词变量不能等）
   const rewrite = (event, text, ...args) => { const r = mods ? mods.filterSync(event, text, ...args) : text; return typeof r === 'string' ? r : r === null ? '' : text }
-  variable('aurabot_persona', () => rewrite('persona', currentPersonaText(cfg.persona.current)))
+  variable('aurabot_persona', () => rewrite('persona', currentPersonaText(resolvePersonaId(cfg))))
   variable('aurabot_rules_private', () => rewrite('rules', rulesText('private', cfg, rulesOpts('private')), 'private'))
   variable('aurabot_rules_social', () => rewrite('rules', rulesText('social', cfg, rulesOpts('social')), 'social'))
 
@@ -75,7 +75,7 @@ export function apply(ctx) {
     getConfig,
     log: logger.child('snowluma'),
     // 控制台密码由插件自动生成并保存，用户不用管
-    savePassword: (pw) => setConfig({ ...cfg, snowluma: { ...cfg.snowluma, webuiPassword: pw, passwordAuto: true } }),
+    savePassword: (pw) => { persistExternalSecret('webuiPassword', pw); setConfig({ ...cfg, snowluma: { ...cfg.snowluma, webuiPassword: pw, passwordAuto: true } }) },
   })
   const endpoint = () => {
     const s = cfg.snowluma
@@ -264,7 +264,7 @@ export function apply(ctx) {
     listModels,
     defaultModel: () => defaultModel(ctx, { model: {} }),
     http: { body: readBody, raw: readRaw, query, send },
-    personas: { list: listPersonas, read: readPersona, current: () => currentPersonaText(cfg.persona.current) },
+    personas: { list: listPersonas, read: readPersona, current: () => currentPersonaText(resolvePersonaId(cfg)), today: () => todayPersona(cfg) },
     getConfig, setConfig,
   }
   mods = createModules({ ctx, core, getConfig, setConfig, logger, version: VERSION, builtins: BUILTINS })
@@ -452,7 +452,16 @@ export function apply(ctx) {
   })
 
   // 人格
-  route('/personas', async () => ({ ok: true, list: listPersonas(), current: cfg.persona.current }))
+  route('/personas', async () => ({ ok: true, list: listPersonas(), current: cfg.persona.current, ...todayPersona(cfg) }))
+  route('/persona/today', async () => ({ ok: true, ...todayPersona(cfg) }))
+  route('/persona/daily', async (req) => {
+    const b = await readBody(req)
+    const daily = typeof b.daily === 'boolean' ? b.daily : cfg.persona.daily
+    const pool = Array.isArray(b.pool) ? b.pool.map((s) => String(s)).filter(Boolean) : cfg.persona.pool
+    setConfig({ ...cfg, persona: { ...cfg.persona, daily, pool } })
+    log.info(`每日随机人格 → ${daily ? '开' : '关'}${pool.length ? '，池子=' + pool.join(',') : ''}`)
+    return { ok: true, ...todayPersona(getConfig()) }
+  })
   route('/persona/get', async (req) => {
     const p = readPersona(query(req).id)
     return p ? { ok: true, persona: p } : { ok: false, message: '没有这个人格' }
@@ -471,9 +480,10 @@ export function apply(ctx) {
   route('/persona/use', async (req) => {
     const b = await readBody(req)
     if (!readPersona(b.id)) return { ok: false, message: '没有这个人格' }
-    setConfig({ ...cfg, persona: { current: b.id } })
-    log.info(`切换人格 → ${b.id}`)
-    return { ok: true, current: b.id, message: '切换好了，下一轮回复起生效' }
+    // 手动指定人格 = 固定下来，同时关掉每日随机（否则当天随机会盖掉手动选）
+    setConfig({ ...cfg, persona: { ...cfg.persona, current: b.id, daily: false } })
+    log.info(`切换人格 → ${b.id}（每日随机已关）`)
+    return { ok: true, current: b.id, daily: false, message: '切换好了，下一轮回复起生效（每日随机人格已关）' }
   })
 
   // 本地接口
@@ -551,7 +561,7 @@ export function apply(ctx) {
     const msg = { ...chat, nickname: owner ? cfg.ownerName || '主人' : '路人', role: '', messageId: 'sim', text, mentioned: Boolean(b.mentioned), replyId: '', images: [], stickers: [], records: [], forwards: [], raw: { simulated: true } }
     const { sent } = await hub.capture(async () => {
       if (text) {
-        const cmd = owner && /^\s*[/／]/.test(text) ? parseCommand(text, mods.commands()) : null
+        const cmd = owner ? parseCommand(text, mods.commands()) : null
         if (cmd && cmd.ext) {
           const reply = String((await cmd.ext.run(cmd.arg, msg)) ?? '')
           steps.push(`命令 /${cmd.name}（模块「${cmd.ext.module}」）回：${reply || '（空）'}`)

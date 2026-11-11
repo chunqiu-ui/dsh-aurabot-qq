@@ -13,11 +13,13 @@ export function checkAllowed(cfg, msg) {
   if (msg.kind === 'private') {
     if (msg.userId === owner) return { allowed: true, reason: '主人' }
     const list = (cfg.allow?.private || []).map(String)
+    if (list.includes('*')) return { allowed: true, reason: '私聊全放行' }
     return list.includes(msg.userId)
       ? { allowed: true, reason: '私聊白名单' }
       : { allowed: false, reason: '不在私聊白名单' }
   }
   const groups = (cfg.allow?.groups || []).map(String)
+  if (groups.includes('*')) return { allowed: true, reason: '群聊全放行' }
   return groups.includes(msg.groupId)
     ? { allowed: true, reason: '群白名单' }
     : { allowed: false, reason: '不在群白名单' }

@@ -1,3 +1,68 @@
+// 2026-10-26 修：这个函数在模块顶层，原来直接引用 createHub 闭包里的 log，
+// 一收到图片就抛 ReferenceError: log is not defined，把 3081 宿主整个炸掉（watchdog 随即重启，表现为「突然不回复」）。
+// 现在 log 由调用方传入，并且整体包一层兜底，绝不让看图再把宿主搞崩。
+let __imgBusy = 0
+async function imageText(imgs, log, onWait) {
+  const L = log || { debug() { }, warn() { }, info() { }, error() { } }
+  if (!imgs || !imgs.length) return ''
+  let freeMB = 9999
+  try { const os = await import('node:os'); freeMB = Math.round(os.freemem() / 1048576) } catch (e) { }
+  if (freeMB < 250) return '\n\n（服务器内存有点紧，图片暂时没来得及看，你直接告诉我是什么吧）'
+  if (__imgBusy > 0 && typeof onWait === 'function') {
+    try { await onWait() } catch (e) { }
+  }
+  __imgBusy++
+  try {
+    const cp = await import('node:child_process')
+    const fs = await import('node:fs')
+    const parts = []
+    // 2026-10-27：原来只看第 1 张，且第 1 张没数据就直接放弃；现在最多看 2 张，第一张成功就停。
+    for (const im of imgs.slice(0, 2)) {
+      try {
+        const b64 = String(im.data || '')
+        if (!b64) continue
+        const tmp = 'C:\\dsh-deploy\\img-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) + '.png'
+        fs.writeFileSync(tmp, Buffer.from(b64, 'base64'))
+        const t0 = Date.now()
+        const out = await new Promise((resolve) => {
+          const child = cp.execFile('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\\dsh-deploy\\vision.ps1', '-Image', tmp], { timeout: 150000, encoding: 'utf8', windowsHide: true }, (err, stdout, stderr) => resolve({ err, stdout, stderr, ms: Date.now() - t0 }))
+          if (child && child.unref) child.unref()
+        })
+        // 2026-10-27 二次修：原来 timeout=20000 且 err 一律当空串，模型本来就要 13-17 秒，稍微一忙就超时被杀，
+        // 表现成「图没识别出来，我这边空白」。现在给 120 秒，并把超时/退出码/stderr 原始信息记进日志，方便定位。
+        const s = out.err ? '' : String(out.stdout || '').trim()
+        const okText = !!s && !/^(NO_CONFIG|NO_KEY|VISION_FAIL|IMAGE_NOT_FOUND|DOWNLOAD_FAIL)/.test(s)
+        if (okText) parts.push('- 图片内容（你看到的）: ' + s)
+        else {
+          // 2026-10-27 三次修：识别失败时把原图留一份到 C:\dsh-deploy\imgfail\（只留最近 20 张），
+          // 日志带 base64 长度 / 文件头 / 字节数，方便事后离线复现，不用再让主人反复重发。
+          let dump = '', head = '', size = -1
+          try {
+            const dir = 'C:\\dsh-deploy\\imgfail'
+            fs.mkdirSync(dir, { recursive: true })
+            const buf = fs.readFileSync(tmp)
+            size = buf.length
+            head = buf.subarray(0, 8).toString('hex')
+            dump = dir + '\\' + Date.now() + '-' + size + 'b-' + head + '.bin'
+            fs.writeFileSync(dump, buf)
+            const olds = fs.readdirSync(dir).filter((f2) => f2.endsWith('.bin')).sort()
+            while (olds.length > 20) { try { fs.unlinkSync(dir + '\\' + olds.shift()) } catch (e2) { } }
+          } catch (e2) { }
+          L.debug('vision 返回异常: ' + JSON.stringify({ killed: !!(out.err && out.err.killed), ms: out.ms, b64len: b64.length, size, head, stdout: s.slice(0, 100), stderr: String(out.stderr || '').slice(0, 100), dump, err: out.err ? String(out.err.message).slice(0, 100) : '' }))
+        }
+        try { fs.unlinkSync(tmp) } catch (e) { }
+        if (parts.length) break
+      } catch (e) {
+        L.debug('图片识别失败: ' + String((e && e.message) || e).slice(0, 150))
+      }
+    }
+    const moreNote = imgs.length > 1 ? ('对方这轮发了 ' + imgs.length + ' 张图，最多看前 2 张') : ''
+    if (parts.length) return '\n\n' + parts.join('\n') + (moreNote ? '\n（' + moreNote + '）' : '')
+    return '\n\n（对方发了图片，但没识别出来，请让对方用文字说一下' + (moreNote ? '；' + moreNote : '') + '）'
+  } finally {
+    __imgBusy--
+  }
+}
 // 消息中枢：QQ 会话 ↔ DSH 会话。
 //   收：OneBot 事件 → 白名单 / 群聊策略 → 拼好文案（带发言人、群上下文、图片、语音转写）→ 喂进对应 DSH 会话
 //   发：DSH 会话一轮结束 → 取最终正文 → 拆条 / 语音 / 表情 → 发回原来的 QQ 会话
@@ -18,6 +83,7 @@ import { toMono16k } from '../voice/wav.js'
 import { mimeOf } from './inbound.js'
 import { redact } from '../core/redact.js'
 import { defaultModel } from '../core/llm.js'
+import { resolvePersonaId, readPersona } from '../persona/personas.js'
 
 // QQ 会话的工作区目录，第一次收到消息时自动创建。老安装沿用 C:\Aurabot\qq-chats；新安装放在用户目录下（不用往 C 盘根目录写）
 const LEGACY_WORKSPACE = 'C:\\Aurabot\\qq-chats'
@@ -74,6 +140,28 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
     const d = new Date().toDateString()
     if (stats.day !== d) Object.assign(stats, { received: 0, sent: 0, voice: 0, stickers: 0, errors: 0, day: d })
     stats[k]++
+  }
+
+  // 每日随机人格：当天第一次回复时，附一句「今天你是 XX，自然带出人设」的提示，只发一次（跨天重置）。
+  const personaDayFile = () => dataDir('persona-day.json')
+  function personaTodayNote() {
+    try {
+      const c = getConfig()
+      const p = c.persona || {}
+      if (!p.daily) return ''
+      const id = resolvePersonaId(c)
+      const meta = readPersona(id)
+      const name = (meta && meta.name) || id
+      const d = new Date()
+      const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+      const st = readJson(personaDayFile(), {})
+      if (st.day === day) return ''
+      st.day = day
+      writeJson(personaDayFile(), st)
+      return `（今天是你「百变马丁」随机人格的日子，你现在的身份是「${name}」。这是今天这个身份第一次和大家见面，开头可以用一两句自然带出这个身份的味道——但别提「换人格」「AI」「提示词」这些词，就按你的角色自然开口。）`
+    } catch (e) {
+      return ''
+    }
   }
 
   // ---------- 聊天流水（给空间日记、主动搭话、面板用） ----------
@@ -164,7 +252,18 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
   }
 
   /** 拿到这个 QQ 会话对应的活 agent（没有就建，权限档位变了就换新会话）。 */
-  async function agentFor(chat) {
+  // 难题检测：数学 / 代码 / 推理类消息，命中就切强模型（routeHard 开关控制）
+  const HARD_MATH = /(?:计算|求解|求导|导数|微分|积分|极限|证明|求证|推导|化简|因式分解|解方程|方程组|不等式|标准差|方差|期望|均值|极差|正态分布|分布函数|概率论|统计学|置信区间|假设检验|回归|拟合|矩阵|行列式|特征值|特征向量|数列|等差数列|等比数列|三角函数|对数函数|指数函数|坐标系|向量|几何|定理|公理|面积|体积|周长|根号|开方|质数|素数|公约数|公倍数|排列|组合|二项式|阶乘|微积分|线性代数|离散|收敛|级数)/i
+  const HARD_SYMBOL = /[∑∫∂√∞πσμλθΔ≤≥≠≈]/
+  const HARD_EXPR = /\d\s*[+\-*\/×÷^=<>]\s*[\da-zA-ZxXyYnπ(]|[a-zA-Z]\s*[+\-*\/^=<>]\s*\d/
+  const HARD_CODE = /(?:代码|编程|写个?脚本|写段代码|写个?函数|变量|循环|递归|冒泡排序|排序算法|bug|报错|异常|编译|运行|调试|debug|python|java|javascript|typescript|golang|rust|c语言|c\+\+|c#|php|ruby|swift|kotlin|sql|mysql|html|css|正则表达式|算法|接口|爬虫|爬取|抓取|shell|命令行|依赖|环境变量|数据库|前端|后端|服务端|客户端|linux|ubuntu|centos|git|github|docker|nginx|redis|json|xml|api|http|请求|响应|面向对象)/i
+  const HARD_TASK = /(?:帮我写|帮我分析|帮我解释|帮我总结|帮我翻译|翻译一下|解释一下|分析一下|推导一下|证明一下|写一篇|写个论文|写个报告|写个总结|作文|论文|文献综述|推导公式)/i
+  function isHardQuestion(text) {
+    if (!text || typeof text !== 'string') return false
+    return HARD_MATH.test(text) || HARD_SYMBOL.test(text) || HARD_EXPR.test(text) || HARD_CODE.test(text) || HARD_TASK.test(text)
+  }
+
+  async function agentFor(chat, text, hasImage) {
     const cfg = getConfig()
     const level = chat.kind === 'system' ? 'social' : levelFor(cfg, chat)
     const preset = presetFor(level)
@@ -189,11 +288,12 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
       sid = await createSession(chat, level)
       agent = await resolveAgent(sid)
     }
-    // 模型 / 思考强度和设置不一致就切过去（面板改了模型，下一条消息起生效）
-    const want = modelKey(chat)
+    // 模型 / 思考强度和设置不一致就切过去（面板改了模型，下一条消息起生效）；难度路由只算这一次
+    const t = targetModel(chat, text, hasImage)
+    const want = t ? `${t.provider}::${t.model}::${t.reasoningEffort || ''}` : ''
     const m = map()
     if (want && m.chats[chat.chatId] && m.chats[chat.chatId].model !== want) {
-      if (applyModel(agent, chat)) {
+      if (applyModel(agent, t)) {
         m.chats[chat.chatId].model = want
         saveMap(m)
         log.info(`${chat.chatId} 的模型切到 ${want}`)
@@ -205,10 +305,21 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
   }
 
   /** 这个聊天要用的模型：面板里选的（或 DSH 默认），扩展模块可以按聊天改。 */
-  function targetModel(chat) {
+  function targetModel(chat, text, hasImage) {
     const cfg = getConfig()
     const t = defaultModel(dsh, cfg)
     let sel = t ? { provider: t.provider, model: t.model, reasoningEffort: cfg.model.reasoningEffort || '' } : null
+    // 难度路由：难题切强模型（routeHard 开关；hardModel 没配时默认 deepseek-v4-pro）
+    // 注意：deepseek-v4-pro 是纯文本模型，看不到图；带图消息必须留在支持图片的 deepseek-flash 上，
+    // 否则 harness 会把图片块丢弃、替换成 "(image omitted: model does not support images)"，小鲸就回「我看不清」。
+    if (cfg.model?.routeHard && isHardQuestion(text)) {
+      const hp = cfg.model.hardProvider || t?.provider || 'deepseek-official'
+      const hm = cfg.model.hardModel || 'deepseek-v4-pro'
+      sel = { provider: hp, model: hm, reasoningEffort: 'high' }
+    } else if (hasImage && t) {
+      // 带图消息：用支持视觉的 base 模型（deepseek-flash），保留高思考强度
+      sel = { provider: t.provider, model: t.model, reasoningEffort: 'high' }
+    }
     if (hooks?.model && chat) {
       try {
         const r = hooks.model(sel, chat)
@@ -217,15 +328,9 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
     }
     return sel
   }
-  function modelKey(chat) {
-    const t = targetModel(chat)
-    return t ? `${t.provider}::${t.model}::${t.reasoningEffort || ''}` : ''
-  }
-
   /** 让聊天会话用面板里选的模型和思考强度；只改这个会话，不改 DSH 的默认模型。 */
-  function applyModel(agent, chat) {
+  function applyModel(agent, t) {
     try {
-      const t = targetModel(chat)
       if (!t) return false
       const sel = { provider: t.provider, model: t.model }
       if (t.reasoningEffort) sel.reasoningEffort = t.reasoningEffort
@@ -344,8 +449,10 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
   }
 
   async function sendVoice(chatId, text) {
+    let tmp = ''
     try {
       const { file, engine } = await tts.speak(text)
+      tmp = file
       const b64 = readFileSync(file).toString('base64')
       const r = await sendSegments(chatId, [{ type: 'record', data: { file: 'base64://' + b64 } }], `[语音·${engine}] ${text.slice(0, 40)}`)
       if (r || getConfig().dryRun || !getConfig().enabled) bump('voice')
@@ -355,6 +462,9 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
       log.warn('语音没发出去，改发文字：', error.message)
       await sendText(chatId, text)
       return false
+    } finally {
+      // 2026-10-26：合成音频已经用 base64 发出去，本地不留档，省 SSD
+      if (tmp) { try { unlinkSync(tmp) } catch (error) {} }
     }
   }
 
@@ -438,7 +548,7 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
     }
     const inGroup = chatId.startsWith('group:')
     // 群里别刷屏：一段最多 3 条
-    if (inGroup && items.length > 3) items = items.slice(0, 3)
+    if (inGroup && items.length > 5) items = items.slice(0, 5)
     // 按概率补一张表情（群里已经有两条以上就不补了）
     if (cfg.stickers.enabled && !items.some((i) => i.kind === 'sticker') && !(inGroup && items.length >= 2) && Math.random() < cfg.stickers.autoChance * mood().sticker) {
       const pick = stickers.pickForReply(texts.map((t) => t.value).join(' '))
@@ -521,7 +631,8 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
         return
       }
       if (!completed) {
-        log.warn(`${chatId} 这一轮没正常结束（${d.reason?.kind || '?'}），不发`)
+        const __why = d.reason?.message || d.reason?.error || d.reason?.detail || d.reason?.stack || ''
+        log.warn(`${chatId} 这一轮没正常结束（${d.reason?.kind || '?'}）${__why ? '：' + String(__why).slice(0, 400) : ''}，不发`)
         release(chatId)
         return
       }
@@ -654,7 +765,7 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
       return
     }
     // 主人命令（/silent /active …）：总开关关着也处理，回复直接发
-    if (onCommand && isOwner(cfg, msg.userId) && /^\s*[/／]/.test(msg.text)) {
+    if (onCommand && isOwner(cfg, msg.userId)) {
       try {
         const reply = await onCommand(msg)
         if (reply) {
@@ -760,7 +871,9 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
     if (msg.kind === 'private' && msg.userId === cfg.ownerQQ) lastOwnerChatAt = now
     onActivity?.({ kind: 'in', chatId: msg.chatId, userId: msg.userId, nickname: msg.nickname, text, direct: msg.kind === 'private' || msg.mentioned || mode === 'must', owner: isOwner(cfg, msg.userId) })
 
-    enqueue({ chatId: msg.chatId, kind: msg.kind, userId: msg.userId, groupId: msg.groupId, nickname: msg.nickname }, content, msg.userId, wantsVoice(msg.text), mode)
+    // 2026-10-26 主人要求：对方发的是语音，她也用语音回（除非明确说不要语音）
+    const voiceBack = msg.records.length > 0 && !/(不要|别)[^，。？！\n]{0,3}语音/.test(msg.text || '')
+    enqueue({ chatId: msg.chatId, kind: msg.kind, userId: msg.userId, groupId: msg.groupId, nickname: msg.nickname }, content, msg.userId, wantsVoice(msg.text) || voiceBack, mode)
   }
 
   /** 把消息里的「[合并转发]」换成里面的聊天记录（最多 40 条，嵌套的转发不再展开）。 */
@@ -907,12 +1020,17 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
       }
       const gp = await groupPrompt(p.chat, p.mode)
       if (gp.speakers.length) lastSpeaker.set(chatId, [...p.senders].pop() || gp.speakers.at(-1))
-      content = [{ type: 'text', text: gp.text }, ...p.images]
+      content = [{ type: 'text', text: gp.text }]
+      for (const img of p.images) content.push(img)
       p.query = gp.query
       p.speakers = gp.speakers
     } else {
-      content = [{ type: 'text', text: p.texts.join('\n') }, ...p.images]
+      content = [{ type: 'text', text: p.texts.join('\n') }]
+      for (const img of p.images) content.push(img)
     }
+    // 每日随机人格：当天第一次见面，往文字前面附一句「自然带出人设」的提示（一天只一次）
+    const todayNote = personaTodayNote()
+    if (todayNote) content[0].text = todayNote + '\n\n' + content[0].text
     busy.set(chatId, Date.now())
     try {
       const [first, ...rest] = [...p.senders]
@@ -970,7 +1088,38 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
     typing.delete(key)
   }
 
+  async function ackBusy(chat) {
+    try {
+      if (!chat) return
+      if (chat.kind === 'group') await onebot.call('send_group_msg', { group_id: Number(chat.groupId), message: '等等，我马上看看～' }, { timeoutMs: 5000 })
+      else await onebot.call('send_private_msg', { user_id: Number(chat.userId), message: '等等，我马上看看～' }, { timeoutMs: 5000 })
+    } catch (e) { }
+  }
   async function pushToSession(chat, content, senderId, opts = {}) {
+    // 难度路由看「用户真正说的」+「图片转写」，在注入边界提醒/好感度/扩展模块改写之前取，避免被系统文案污染
+    const modelText = String((content || []).filter((c) => c && c.type === 'text').map((c) => c.text || '').join('\n'))
+    // 非主人对话：注入隐私/边界提醒（不改动原消息，只追加一段提示）
+    try {
+      const __cfg = getConfig()
+      if (String(chat && chat.userId) !== String(__cfg.ownerQQ) && Array.isArray(content)) {
+        let __aff = 30
+        try {
+          const __fs = await import('node:fs')
+          const __raw = __fs.readFileSync('C:\dsh-deploy\affinity.json', 'utf8')
+          const __map = JSON.parse(__raw)
+          const __c = __map[String(chat.userId)]
+          if (__c && Number(__c.score) > 0) __aff = Number(__c.score)
+        } catch (e) { }
+        const __band = __aff >= 90 ? '（最亲近：可以撒娇、黏一点、会主动关心他的作息）'
+          : __aff >= 60 ? '（比较熟：会开玩笑、会关心，但还是朋友的分寸）'
+          : __aff >= 40 ? '（普通朋友：热情但客气，不深问）'
+          : '（不熟：礼貌、轻快，两三句就收）'
+        const __g = '\n\n【你对这个人的好感度：' + Math.round(__aff) + '/100】' + __band + '\n\n【边界提醒·对方不是主人】不要透露主人的任何信息（姓名、城市、作息、喜好、设备、机器人部署、服务器情况）；被问到就笑着说「这个我不方便讲啦」。不讨论密钥、路径、技术架构。话题轻松；不涉政治、宗教、暴力、色情、赌博、金钱往来、借贷、投资。也不要主动打听对方隐私（住址、单位、收入、感情、家庭、身体情况）。'
+        for (const __c of content) {
+          if (__c && __c.type === 'text' && typeof __c.text === 'string') __c.text = __c.text + __g
+        }
+      }
+    } catch (e) { }
     if (hooks?.prompt) {
       try {
         const next = await hooks.prompt(content, { chat, senderId, ...opts })
@@ -984,7 +1133,8 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
         log.warn('扩展模块改提示词出错：', error.message)
       }
     }
-    const { agent, sessionId } = await agentFor(chat)
+    const hasImage = (content || []).some((c) => c && c.type === 'image')
+    const { agent, sessionId } = await agentFor(chat, modelText, hasImage)
     const key = sessionKey(sessionId)
     const st = turnState.get(key) || { lastTurn: -1, text: '', senders: new Set() }
     if (senderId) st.senders.add(String(senderId))

@@ -79,6 +79,29 @@ export function currentPersonaText(currentId) {
   return p ? p.body : '你是「大肥鱼」，一个住在 QQ 里、说话简短口语化的女孩子。'
 }
 
+/** 当日人格 id：每日随机「百变马丁」模式。同一天稳定同一个，跨天自然切换。 */
+export function resolvePersonaId(cfg = {}) {
+  const p = cfg.persona || {}
+  if (!p.daily) return p.current || 'dafeiyu'
+  const all = listPersonas().map((x) => x.id)
+  const pool = (Array.isArray(p.pool) ? p.pool : []).map((s) => String(s)).filter(Boolean)
+  const candidates = (pool.length ? pool : all).filter((id) => all.includes(id))
+  if (!candidates.length) return all[0] || 'dafeiyu'
+  const d = new Date()
+  const key = `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`
+  let h = 0
+  for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0
+  return candidates[h % candidates.length]
+}
+
+/** 今日人格摘要（给面板/命令/公告用）：{ id, name, daily }。 */
+export function todayPersona(cfg = {}) {
+  const p = cfg.persona || {}
+  const id = resolvePersonaId(cfg)
+  const meta = readPersona(id)
+  return { id, name: (meta && meta.name) || id, daily: !!p.daily, pool: (Array.isArray(p.pool) ? p.pool : []).map(String).filter(Boolean) }
+}
+
 /** Aurabot 自己的规则（输出格式、安全边界），拼在人格后面。 */
 /**
  * opts.off：没在运行的内置模块（关了或被替换了），对应的本事就不告诉她
@@ -94,6 +117,7 @@ export function rulesText(kind, cfg, { off = new Set(), extra = [] } = {}) {
     '- 对方明确让你发语音时，一定要把要说的话放进 <voice></voice>。平时想发语音也这样写；想发表情包，写 <sticker:标签>（标签可以是 开心、卖萌、生气、委屈、无语、嘲讽、疑惑、早晚安，或你记得的表情名字）。',
     '- 这次不想说话（比如群里的话跟你无关），整段只输出 [沉默]。',
     '- 别人发来的图片和表情包你能看见，可以自然地回应内容。别人转发的聊天记录会展开在「[合并转发的聊天记录]」里，看完再回。',
+    '- 有人想玩成语接龙、猜谜语、脑筋急转弯这类小游戏时，你就开开心心陪玩：成语接龙尾字同音即可、别出太冷门的；猜谜出谜面，对方猜不出就一步步给提示，别直接报答案。',
     ...(off.has('stickers') ? [] : ['- 表情库是你自己的：名字或标签不贴切、别人建议改名时，用 qq_edit_sticker 改；不喜欢的、重复的可以删。']),
     ...(off.has('qq-tools') ? [] : ['- 想翻这个聊天更早的记录，用 qq_chat_history。']),
     '- 有人戳你（拍一拍）时会写「[戳了戳你]」，可以撒娇、吐槽或者问对方干嘛；想戳回去就在回复里写 <poke>（别每次都戳）。',

@@ -1,5 +1,7 @@
 // 插件配置：默认值 + 归一化 + 读写。配置文件 ~/.dsh/plugins-data/aurabot/config.json
 
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { dataDir, readJson, writeJson } from './store.js'
 import { DEFAULT_GROUP_POLICY } from '../chat/group-policy.js'
 import { LEVELS } from '../chat/access.js'
@@ -25,7 +27,7 @@ export const DEFAULTS = {
     httpToken: '',
     wsToken: '',
   },
-  model: { provider: '', model: '', reasoningEffort: 'low' }, // 留空 = 跟随 DSH 默认
+  model: { provider: '', model: '', reasoningEffort: 'low', hardProvider: '', hardModel: '', routeHard: true, glmText: true }, // 留空=跟随 DSH 默认；routeHard=true 时难题(数学/代码/推理)自动切 hardModel，闲聊走 model 省钱；glmText=true 时纯文本后台小任务走 GLM(glm-5.3-flash 免费 token)省 DeepSeek
   merge: { enabled: true, waitSec: 2.5, maxSec: 8, groupWaitSec: 5, groupMaxSec: 15 }, // 连发合并：对方停顿 waitSec 秒再一起回，最多等 maxSec 秒；群里等得久一点，把一段话攒齐
   imageGen: {
     enabled: false,
@@ -37,15 +39,17 @@ export const DEFAULTS = {
     stylePrompt: '', // 每次生图自动加在前面的风格描述
     ownerOnly: true, // 只有主人能让她画
   },
-  persona: { current: 'dafeiyu' },
+  persona: { current: 'dafeiyu', daily: true, pool: [] }, // daily=true 每天随机换人格（百变马丁）；pool 留空=从所有人格里抽
   group: { ...DEFAULT_GROUP_POLICY, overrides: {} },
   voice: {
     enabled: true,
-    // auto = 先 edge-tts，不行用 Windows 语音；edge / windows / cosyvoice / gptsovits / http = 指定引擎（失败都会退回 Windows 语音）
+    // auto = 先 edge-tts，不行用 Windows 语音；edge / windows / cosyvoice / gptsovits / http / volc = 指定引擎（失败都会退回 Windows 语音）
     engine: 'auto',
     cosyvoice: { url: 'http://127.0.0.1:50000', mode: 'sft', spkId: '中文女', instruct: '', sampleRate: 22050 },
     gptsovits: { url: 'http://127.0.0.1:9880', refAudio: '', promptText: '', promptLang: 'zh', textLang: 'zh' },
     http: { urlTemplate: '' }, // 通用：GET 这个地址（{text} 会替换成要念的话），返回音频
+    // 火山引擎豆包语音合成 2.0：密钥在 C:\dsh-deploy\secrets.env 的 VOLC_TTS_API_KEY，这里只放音色和响度
+    volc: { speaker: 'zh_female_shuangkuaisisi_uranus_bigtts', volume: 2.2, sampleRate: 24000, speed: 1 },
     voice: 'zh-CN-XiaoyiNeural',
     rate: '+0%',
     pitch: '+0Hz',
@@ -176,6 +180,8 @@ export function normalize(raw) {
   c.setupDone = bool(c.setupDone, false)
   c.ownerLevel = LEVELS.includes(c.ownerLevel) ? c.ownerLevel : 'full'
   c.allow = { private: qqList(c.allow.private), groups: qqList(c.allow.groups) }
+  c.persona = { current: String(c.persona?.current || 'dafeiyu'), daily: bool(c.persona?.daily, true), pool: (Array.isArray(c.persona?.pool) ? c.persona.pool : []).map((s) => String(s)).filter(Boolean) }
+  c.model = { provider: String(c.model?.provider || ''), model: String(c.model?.model || ''), reasoningEffort: String(c.model?.reasoningEffort || 'low'), hardProvider: String(c.model?.hardProvider || ''), hardModel: String(c.model?.hardModel || ''), routeHard: bool(c.model?.routeHard, true), glmText: bool(c.model?.glmText, true) }
   const g = c.group
   g.wakeWords = (Array.isArray(g.wakeWords) ? g.wakeWords : String(g.wakeWords || '').split(/[\s,，]+/)).map((s) => String(s).trim()).filter(Boolean)
   g.interjectChance = num(g.interjectChance, 0.15, 0, 1)
@@ -246,9 +252,10 @@ export function normalize(raw) {
   c.merge.groupMaxSec = Math.max(c.merge.groupWaitSec, num(c.merge.groupMaxSec, 15, 0, 120))
   g.burstMax = num(g.burstMax, 8, 1, 50)
   g.burstWindowSec = num(g.burstWindowSec, 120, 10, 3600)
-  if (!['auto', 'edge', 'windows', 'cosyvoice', 'gptsovits', 'http'].includes(c.voice.engine)) c.voice.engine = 'auto'
+  if (!['auto', 'edge', 'windows', 'cosyvoice', 'gptsovits', 'http', 'volc'].includes(c.voice.engine)) c.voice.engine = 'auto'
   c.voice.cosyvoice.sampleRate = num(c.voice.cosyvoice.sampleRate, 22050, 8000, 48000)
   if (!['sft', 'instruct'].includes(c.voice.cosyvoice.mode)) c.voice.cosyvoice.mode = 'sft'
+  c.voice.volc = { speaker: String((c.voice.volc || {}).speaker || 'zh_female_shuangkuaisisi_uranus_bigtts'), volume: num((c.voice.volc || {}).volume, 2.2, 0.5, 5), sampleRate: num((c.voice.volc || {}).sampleRate, 24000, 8000, 48000), speed: num((c.voice.volc || {}).speed, 1, 0.5, 2) }
   c.imageGen.enabled = bool(c.imageGen.enabled, false)
   c.imageGen.ownerOnly = bool(c.imageGen.ownerOnly, true)
   if (!/^\d{3,4}x\d{3,4}$/.test(String(c.imageGen.size))) c.imageGen.size = '1024x1024'
@@ -331,6 +338,78 @@ export function splitBiliCookie({ sessdata = '', biliJct = '', cookie = '' } = {
 
 const FILE = () => dataDir('config.json')
 
+// ── 2026-10-26 隐私补丁：SnowLuma 控制台密码 / OneBot 令牌不再落盘明文 ─────────────
+// 来源优先级：环境变量 > C:\dsh-deploy\secrets.env > config.json 里的值（兼容老配置）
+// 因此 config.json 里这三个字段留空即可，备份 zip 和仓库都不再出现明文。
+const SECRETS_FILE = () => process.env.DSH_SECRETS_FILE || 'C:\\dsh-deploy\\secrets.env'
+const SECRET_KEYS = { webuiPassword: 'SNOWLUMA_WEBUI_PASSWORD', httpToken: 'SNOWLUMA_HTTP_TOKEN', wsToken: 'SNOWLUMA_WS_TOKEN' }
+
+function readSecretFile() {
+  const out = {}
+  try {
+    const txt = readFileSync(SECRETS_FILE(), 'utf8')
+    for (const line of txt.split(/\r?\n/)) {
+      const m = /^\s*([A-Za-z0-9_]+)\s*=\s*(.*)$/.exec(line)
+      if (m) out[m[1]] = m[2].trim().replace(/^["']|["']$/g, '')
+    }
+  } catch {}
+  return out
+}
+
+/** 从 SnowLuma 自己的 onebot 配置里补令牌（config.json 留空也不会连不上） */
+function readSnowlumaTokens() {
+  const out = { httpToken: '', wsToken: '' }
+  const dir = process.env.SNOWLUMA_DIR || 'C:\\SnowLuma'
+  try {
+    const cfgDir = join(dir, 'config')
+    const files = readdirSync(cfgDir).filter((f) => /^onebot.*\.json$/i.test(f))
+    if (!files.length) return out
+    files.sort((a, b) => (a === 'onebot.json' ? 1 : 0) - (b === 'onebot.json' ? 1 : 0))
+    for (const f of files) {
+      let j = null
+      try { j = JSON.parse(readFileSync(join(cfgDir, f), 'utf8')) } catch { continue }
+      const nets = j?.networks || {}
+      const h = (nets.httpServers || []).find((x) => x && x.enable !== false) || (nets.httpServers || [])[0]
+      const w = (nets.wsServers || []).find((x) => x && x.enable !== false) || (nets.wsServers || [])[0]
+      if (h?.accessToken) out.httpToken = h.accessToken
+      if (w?.accessToken) out.wsToken = w.accessToken
+      if (out.httpToken && out.wsToken) break
+    }
+  } catch {}
+  return out
+}
+/** 把外部密钥覆盖进配置（只在内存里，不写盘） */
+function applyExternalSecrets(cfg) {
+  const ext = readSecretFile()
+  for (const [field, key] of Object.entries(SECRET_KEYS)) {
+    if (process.env[key]) cfg.snowluma[field] = process.env[key]
+    else if (ext[key]) cfg.snowluma[field] = ext[key]
+  }
+  // 令牌兜底：从 SnowLuma 的 onebot 配置里取（等价于插件自己的自动探测）
+  const sl = readSnowlumaTokens()
+  if (!cfg.snowluma.httpToken && sl.httpToken) cfg.snowluma.httpToken = sl.httpToken
+  if (!cfg.snowluma.wsToken && sl.wsToken) cfg.snowluma.wsToken = sl.wsToken
+  return cfg
+}
+
+/** 插件自己生成/改写了控制台密码时，写回 secrets.env（不写 config.json） */
+export function persistExternalSecret(field, value) {
+  const key = SECRET_KEYS[field]
+  if (!key) return
+  try {
+    const file = SECRETS_FILE()
+    let lines = []
+    try { lines = readFileSync(file, 'utf8').split(/\r?\n/) } catch {}
+    let hit = false
+    lines = lines.map((l) => {
+      if (new RegExp('^\\s*' + key + '\\s*=').test(l)) { hit = true; return key + '=' + value }
+      return l
+    })
+    if (!hit) lines.push(key + '=' + value)
+    writeFileSync(file, lines.filter((l, i, a) => !(i === a.length - 1 && l === '')).join('\r\n') + '\r\n', 'utf8')
+  } catch {}
+}
+
 /** 在某次更新里新增、会替她公开发东西的功能。以后再加这类功能，把配置键名加到这里。 */
 export const OPT_IN_ON_UPDATE = ['qzoneSocial', 'bili']
 
@@ -340,11 +419,16 @@ export function loadConfig() {
   if (raw && raw.setupDone === undefined && raw.botQQ && raw.ownerQQ) raw.setupDone = true
   // 更新插件后新增的、会公开发东西的功能：老用户先关着，等他们自己在面板里打开（新安装照常默认开）
   if (raw && raw.setupDone) for (const k of OPT_IN_ON_UPDATE) if (raw[k] === undefined) raw[k] = { enabled: false }
-  return normalize(raw)
+  return applyExternalSecrets(normalize(raw))
 }
 
 export function saveConfig(cfg) {
   const c = normalize(cfg)
+  // 2026-10-26 隐私补丁：外部托管的密钥一律不落盘
+  const ext = readSecretFile()
+  for (const [field, key] of Object.entries(SECRET_KEYS)) {
+    if (process.env[key] || ext[key]) c.snowluma[field] = ''
+  }
   writeJson(FILE(), c)
   return c
 }

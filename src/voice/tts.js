@@ -4,7 +4,7 @@
 // 管线：文字 → TTS → 文件路径。任何一步失败由调用方退回发文字。（RVC 音色目前用在翻唱上，见 src/song/）
 
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, statSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, statSync, readdirSync, unlinkSync, writeFileSync, readFileSync } from 'node:fs'
 import { buildWav } from './wav.js'
 import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
@@ -51,7 +51,7 @@ function outDir() {
   try {
     for (const n of readdirSync(d)) {
       const p = join(d, n)
-      if (Date.now() - statSync(p).mtimeMs > 86400_000) unlinkSync(p)
+      if (Date.now() - statSync(p).mtimeMs > 3600_000) unlinkSync(p)
     }
   } catch (error) {}
   return d
@@ -195,6 +195,100 @@ async function httpSynth(text, c) {
   return saveAudio(await fetchAudio(tpl.split('{text}').join(encodeURIComponent(text)), { method: 'GET' }), 24000)
 }
 
+// ---------- 火山引擎豆包语音合成 2.0（seed-tts-2.0，2026-10-26 接入） ----------
+// 鉴权：单 API Key（X-Api-Key）+ X-Api-Resource-Id；密钥只从 secrets 读，不写进 bot 配置
+// 2026-10-29：密钥改走 DPAPI 加密的 secrets.dat（secrets.ps1），不再留明文 secrets.env
+const VOLC_SECRETS = 'C:\\dsh-deploy\\secrets.env' // 兼容旧明文（一般已不存在）
+const SECRETS_PS1 = 'C:\\dsh-deploy\\secrets.ps1'
+const FFMPEG = 'C:\\ffmpeg\\bin\\ffmpeg.exe'
+
+let __secrets = null
+async function loadSecrets() {
+  if (__secrets) return __secrets
+  const map = {}
+  // 旧明文 secrets.env 兜底
+  try {
+    for (const line of readFileSync(VOLC_SECRETS, 'utf8').split(/\r?\n/)) {
+      const s = line.trim()
+      if (!s || s.startsWith('#')) continue
+      const i = s.indexOf('=')
+      if (i > 0) map[s.slice(0, i).trim()] = s.slice(i + 1).trim()
+    }
+  } catch (error) {}
+  // DPAPI 加密库：secrets.ps1 -All 输出 KEY=VALUE
+  try {
+    const ps = process.env.SystemRoot ? join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : 'powershell.exe'
+    const r = await run(ps, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', SECRETS_PS1, '-All'], { timeoutMs: 30000 })
+    for (const line of (r.out || '').split(/\r?\n/)) {
+      const s = line.trim()
+      if (!s || s.startsWith('#')) continue
+      const i = s.indexOf('=')
+      if (i > 0) map[s.slice(0, i).trim()] = s.slice(i + 1).trim()
+    }
+  } catch (error) {}
+  __secrets = map
+  return map
+}
+
+async function secretOf(name) {
+  const m = await loadSecrets()
+  return m[name] || ''
+}
+
+/** 火山 TTS 原始响度 mean 约 -17dB，手机外放偏小：ffmpeg 放大 + 压峰，失败就用原文件 */
+async function loudify(file, volume) {
+  if (!volume || volume <= 1.01) return file
+  const out = join(outDir(), `${randomUUID()}.mp3`)
+  const r = await run(FFMPEG, ['-y', '-hide_banner', '-loglevel', 'error', '-i', file,
+    '-af', `volume=${volume},alimiter=limit=0.85:level=false`, '-c:a', 'libmp3lame', '-b:a', '64k', out], { timeoutMs: 60000 })
+  if (r.code !== 0 || !existsSync(out) || statSync(out).size < 500) return file
+  try { unlinkSync(file) } catch (error) {}
+  return out
+}
+
+async function volcSynth(text, c = {}) {
+  const key = c.apiKey || (await secretOf('VOLC_TTS_API_KEY')) || process.env.VOLC_TTS_API_KEY || ''
+  if (!key) throw new Error('没有火山 TTS 密钥（secrets 里的 VOLC_TTS_API_KEY）')
+  const speaker = c.speaker || (await secretOf('VOLC_TTS_SPEAKER')) || 'zh_female_shuangkuaisisi_uranus_bigtts'
+  const resourceId = c.resourceId || (await secretOf('VOLC_TTS_RESOURCE_ID')) || 'seed-tts-2.0'
+  const sampleRate = c.sampleRate || 24000
+  const body = {
+    user: { uid: 'aurabot' },
+    req_params: {
+      text,
+      speaker,
+      audio_params: { format: 'mp3', sample_rate: sampleRate },
+      ...(c.speed && c.speed !== 1 ? { speed_ratio: c.speed } : {}),
+    },
+  }
+  const r = await fetch('https://openspeech.bytedance.com/api/v3/tts/unidirectional', {
+    method: 'POST',
+    headers: {
+      'X-Api-Key': key,
+      'X-Api-Resource-Id': resourceId,
+      'X-Api-Request-Id': randomUUID(),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(60000),
+  })
+  if (!r.ok) throw new Error(`火山 TTS HTTP ${r.status}`)
+  // 返回是逐行 JSON，音频在每行的 data（base64 mp3 分片），要按行拼接
+  const raw = await r.text()
+  let b64 = ''
+  let err = ''
+  for (const line of raw.split('\n')) {
+    const t = line.trim()
+    if (!t.startsWith('{')) continue
+    let o
+    try { o = JSON.parse(t) } catch (error) { continue }
+    if (o.data) b64 += o.data
+    if (o.code && o.code !== 0 && o.message) err = `${o.code} ${o.message}`
+  }
+  if (!b64) throw new Error('火山 TTS 没给音频：' + (err || 'empty'))
+  return loudify(saveAudio(Buffer.from(b64, 'base64'), sampleRate), c.volume)
+}
+
 /** 说话语音的后处理：目前原样返回（RVC 换音色只用在翻唱上，语音条直接用 TTS 的声音）。 */
 export const voiceConverters = []
 
@@ -206,7 +300,7 @@ export async function textToSpeech(text, opt = {}, log) {
   if (!clean) throw new Error('没有要念的文字')
   let file = ''
   let engine = ''
-  const local = { cosyvoice: cosyvoiceSynth, gptsovits: gptsovitsSynth, http: httpSynth }[opt.engine]
+  const local = { cosyvoice: cosyvoiceSynth, gptsovits: gptsovitsSynth, http: httpSynth, volc: volcSynth }[opt.engine]
   if (local) {
     try {
       file = await local(clean, opt[opt.engine] || {})
