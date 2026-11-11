@@ -78,7 +78,7 @@ export function assistantReplyText (message) {
   return message.content.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n').trim()
 }
 
-export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildTools, contextProviders, onActivity, memoryScore, onMemoryCommand, onCommand, isMuted, dislikes, random = Math.random, moodEffects, localApi, hooks, availableModels, toolsGeneration, capabilitiesOf }) {
+export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildTools, contextProviders, onActivity, memoryScore, onMemoryCommand, onCommand, isCommandText, isMuted, dislikes, random = Math.random, moodEffects, localApi, hooks, availableModels, toolsGeneration, capabilitiesOf }) {
   // 心情对行为的影响（表情 / 语音概率、回复快慢、插话积极程度），没接就是 1
   const mood = () => (typeof moodEffects === 'function' ? moodEffects() : null) || { sticker: 1, voice: 1, delay: 1, chatty: 1 }
   const mapFile = () => dataDir('sessions.json')
@@ -1403,7 +1403,7 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
       recentMedia.remember(msg.chatId, segmentsOf(event).filter((seg) => msg.images.includes(seg) || msg.stickers.includes(seg)).map((seg) => ({ seg, userId: msg.userId, sticker: msg.stickers.includes(seg) })))
     }
     // 主人命令（/silent /active …）：总开关关着也处理，回复直接发
-    if (onCommand && isOwner(cfg, msg.userId) && /^\s*[/／]/.test(msg.text)) {
+    if (onCommand && isOwner(cfg, msg.userId) && (/^\s*[/／]/.test(msg.text) || (typeof isCommandText === 'function' && isCommandText(msg.text)))) {
       try {
         const reply = await onCommand(msg)
         if (disposed) return

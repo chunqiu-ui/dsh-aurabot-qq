@@ -78,7 +78,8 @@ export const DEFAULTS = {
     // 实验性订阅接法；登录令牌独立保存在数据目录，不进入配置。
     codex: { model: 'gpt-image-2', quality: 'auto', background: 'auto' },
   },
-  persona: { current: 'dafeiyu' },
+  // daily = 每天按日期从 pool 里轮换一个人格（pool 留空=全部人格）；关掉就是固定 current
+  persona: { current: 'dafeiyu', daily: false, pool: [] },
   // 主人私聊里问起群里的事：把最近 24 小时的群聊流水补进这一轮（默认关，开启前先把群加进白名单）
   group: { ...DEFAULT_GROUP_POLICY, overrides: {}, ownerBrief: { enabled: false, lines: 12, groups: [] } },
   // 按群头衔不回：勾选的群里，专属头衔正好是 title 的成员（一般是别的机器人）说话、戳她都不理。没勾群就不起作用
@@ -337,6 +338,7 @@ export function normalize(raw) {
   // 视觉能力：auto = 问 DSH 的模型元数据；on / off = 主人手动声明（覆盖元数据）
   c.model.vision = c.model.vision === 'on' || c.model.vision === 'off' ? c.model.vision : 'auto'
   c.setupDone = bool(c.setupDone, false)
+  c.persona = { current: String(c.persona?.current || 'dafeiyu'), daily: bool(c.persona?.daily, false), pool: (Array.isArray(c.persona?.pool) ? c.persona.pool : []).map((x) => String(x)).filter(Boolean) }
   c.ownerLevel = LEVELS.includes(c.ownerLevel) ? c.ownerLevel : 'full'
   c.longTasks = bool(c.longTasks, true)
   c.subagentBackground = bool(c.subagentBackground, false)

@@ -1,27 +1,39 @@
 // QQ 里的主人命令：/silent /active 之类，直接在 QQ 上管她。只认主人；在总开关关着时也能用（所以 /on 才有用）。
 
 import { dataDir, readJson, writeJson } from '../core/store.js'
+import { resolvePersonaId, readPersona } from '../persona/personas.js'
 
 /**
  * 解析命令：「/silent 30」→ { name: 'silent', arg: '30' }。不是命令返回 null。支持全角斜杠和中文别名。
  * extra：扩展模块加的命令 [{ name, aliases, desc, run }]，命中时返回 { name, arg, ext }；和内置同名时扩展的优先。
  */
 export function parseCommand(text, extra = []) {
-  const m = String(text || '').trim().match(/^[/／]\s*([A-Za-z0-9一-龥_-]+)\s*([\s\S]*)$/)
-  if (!m) return null
-  const word = m[1].toLowerCase()
+  const t = String(text || '').trim()
+  if (!t) return null
+  const m = t.match(/^[/／]\s*([A-Za-z0-9一-龥_-]+)\s*([\s\S]*)$/)
+  if (m) {
+    const word = m[1].toLowerCase()
+    for (const c of extra) {
+      const names = [c.name, ...(c.aliases || [])].map((x) => String(x).toLowerCase())
+      if (names.includes(word)) return { name: c.name, arg: m[2].trim(), ext: c }
+      // 中文命令后面直接跟内容：「/天气北京」
+      const pre = names.filter((k) => /[一-龥]/.test(k) && word.startsWith(k)).sort((a, b) => b.length - a.length)[0]
+      if (pre) return { name: c.name, arg: (m[1].slice(pre.length) + ' ' + m[2]).trim(), ext: c }
+    }
+    const name = ALIASES[word] || word
+    if (COMMANDS[name]) return { name, arg: m[2].trim() }
+    // 中文命令后面不加空格直接跟内容：「/记住我不吃香菜」
+    const pre = Object.keys(ALIASES).filter((k) => /[一-龥]/.test(k) && word.startsWith(k)).sort((a, b) => b.length - a.length)[0]
+    return pre ? { name: ALIASES[pre], arg: (m[1].slice(pre.length) + ' ' + m[2]).trim() } : null
+  }
+  // 不打斜杠也行：整条消息恰好是一个命令词/别名时按命令处理（带参数的长句照旧交给模型）
+  const w = t.toLowerCase()
   for (const c of extra) {
     const names = [c.name, ...(c.aliases || [])].map((x) => String(x).toLowerCase())
-    if (names.includes(word)) return { name: c.name, arg: m[2].trim(), ext: c }
-    // 中文命令后面直接跟内容：「/天气北京」
-    const pre = names.filter((k) => /[一-龥]/.test(k) && word.startsWith(k)).sort((a, b) => b.length - a.length)[0]
-    if (pre) return { name: c.name, arg: (m[1].slice(pre.length) + ' ' + m[2]).trim(), ext: c }
+    if (names.includes(w)) return { name: c.name, arg: '', ext: c }
   }
-  const name = ALIASES[word] || word
-  if (COMMANDS[name]) return { name, arg: m[2].trim() }
-  // 中文命令后面不加空格直接跟内容：「/记住我不吃香菜」
-  const pre = Object.keys(ALIASES).filter((k) => /[一-龥]/.test(k) && word.startsWith(k)).sort((a, b) => b.length - a.length)[0]
-  return pre ? { name: ALIASES[pre], arg: (m[1].slice(pre.length) + ' ' + m[2]).trim() } : null
+  const nm = ALIASES[w] || w
+  return COMMANDS[nm] ? { name: nm, arg: '' } : null
 }
 
 const ALIASES = {
@@ -35,6 +47,10 @@ const ALIASES = {
   状态: 'status', 心情: 'mood', 日记: 'diary', 记住: 'remember', 记一下: 'remember',
   搭话: 'speak', 主动搭话: 'speak',
   重开: 'reset', 开机: 'on', 关机: 'off', 帮助: 'help', 命令: 'help', h: 'help',
+  今日: 'today', 今天是谁: 'today', 人格: 'today', 我是谁: 'today', whoami: 'today',
+  随机人格: 'daily', 每日随机: 'daily', 百变马丁: 'daily',
+  猜谜: 'riddle', 猜谜语: 'riddle', 谜语: 'riddle', 脑筋急转弯: 'riddle',
+  成语接龙: 'idiom', 接龙: 'idiom',
 }
 
 const COMMANDS = {
@@ -54,6 +70,10 @@ const COMMANDS = {
   reset: '这个聊天重新开始（旧的对话在 DSH 侧栏里还能找回）',
   on: '打开总开关',
   off: '关掉总开关（之后除了命令什么都不回）',
+  today: '看她今天是谁（每日随机人格）',
+  daily: '开/关每日随机人格：/随机人格 开 或 /随机人格 关',
+  riddle: '来玩猜谜，我出一个你猜（猜不出有提示）',
+  idiom: '来玩成语接龙（尾字同音即可）',
 }
 
 export const commandList = (extra = []) => [
@@ -219,6 +239,24 @@ export async function runCommand(cmd, msg, deps) {
     case 'off':
       setConfig({ ...cfg, enabled: false })
       return '好，我先下线了。发 /on 叫我回来'
+    case 'today': {
+      const id = resolvePersonaId(cfg)
+      const p = readPersona(id)
+      const name = (p && p.name) || id
+      return cfg.persona && cfg.persona.daily
+        ? `今天我是「${name}」～（每日随机人格开着，明天又会变）`
+        : `我现在是「${name}」（每日随机人格关着，固定不换啦）`
+    }
+    case 'daily': {
+      const a = String(cmd.arg || '').trim()
+      const on = /^(开|on|1|true|是|yes)$/i.test(a) ? true : /^(关|off|0|false|否|no)$/i.test(a) ? false : !(cfg.persona && cfg.persona.daily)
+      setConfig({ ...cfg, persona: { ...(cfg.persona || {}), daily: on } })
+      return on ? '好，以后每天随机换一个人格（百变马丁模式开啦）' : '好，每日随机人格关了，就固定现在的样子'
+    }
+    case 'riddle':
+      return '来猜谜～我先出一个：\n「有面没有口，有脚没有手，虽有四只脚，自己不会走。」\n（打一日常用品）猜不到就说「给个提示」'
+    case 'idiom':
+      return '成语接龙来咯，我先起头：\n「一心一意」\n你接最后一个字「意」开头的，同音也行～'
     default:
       return null
   }

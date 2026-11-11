@@ -84,6 +84,32 @@ export function currentPersonaText(currentId) {
   return p ? p.body : '你是「大肥鱼」，一个住在 QQ 里、说话简短口语化的女孩子。'
 }
 
+/**
+ * 当日人格 id（每日随机「百变马丁」）。同一天稳定同一个，跨天自然换。
+ * persona.daily = false 时就是手动选的那个；pool 里只认真实存在的人格。
+ */
+export function resolvePersonaId(cfg = {}) {
+  const p = cfg.persona || {}
+  if (!p.daily) return p.current || 'dafeiyu'
+  const all = listPersonas().map((x) => x.id)
+  const pool = (Array.isArray(p.pool) ? p.pool : []).map((x) => String(x)).filter(Boolean)
+  const candidates = (pool.length ? pool : all).filter((id) => all.includes(id))
+  if (!candidates.length) return all[0] || 'dafeiyu'
+  const d = new Date()
+  const key = `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`
+  let h = 0
+  for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0
+  return candidates[h % candidates.length]
+}
+
+/** 今日人格摘要，给面板和命令用：{ id, name, daily, pool }。 */
+export function todayPersona(cfg = {}) {
+  const p = cfg.persona || {}
+  const id = resolvePersonaId(cfg)
+  const meta = readPersona(id)
+  return { id, name: (meta && meta.name) || id, daily: !!p.daily, pool: (Array.isArray(p.pool) ? p.pool : []).map(String).filter(Boolean) }
+}
+
 /** Aurabot 自己的规则（输出格式、安全边界），拼在人格后面。 */
 /**
  * opts.off：没在运行的内置模块（关了或被替换了），对应的本事就不告诉她

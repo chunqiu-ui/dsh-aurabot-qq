@@ -27,7 +27,7 @@ import { mimeOf } from './chat/inbound.js'
 import { dataDir, ensureDir } from './core/store.js'
 import { createUpdateChecker, changelogSection } from './core/update.js'
 import { parseCommand, runCommand, createMutes, commandList } from './chat/commands.js'
-import { listPersonas, readPersona, savePersona, deletePersona, currentPersonaText, rulesText, seedPersonas } from './persona/personas.js'
+import { listPersonas, readPersona, savePersona, deletePersona, currentPersonaText, rulesText, seedPersonas, resolvePersonaId, todayPersona } from './persona/personas.js'
 import { createModules, API_VERSION } from './core/modules.js'
 import { createCommunity } from './core/community.js'
 import { createApprovalRelay } from './security/approval.js'
@@ -93,7 +93,7 @@ export function apply(ctx) {
   const rulesOpts = (kind) => (mods ? { off: mods.builtinOff(), extra: mods.rules(kind) } : {})
   // 扩展模块能整段改写人格和规则（同步：提示词变量不能等）
   const rewrite = (event, text, ...args) => { const r = mods ? mods.filterSync(event, text, ...args) : text; return typeof r === 'string' ? r : r === null ? '' : text }
-  variable('aurabot_persona', () => rewrite('persona', currentPersonaText(cfg.persona.current)))
+  variable('aurabot_persona', () => rewrite('persona', currentPersonaText(resolvePersonaId(cfg))))
   variable('aurabot_rules_private', () => {
     const base = rewrite('rules', rulesText('private', cfg, rulesOpts('private')), 'private')
     // 危险命令确认开着时补一句：被拦下要如实告诉主人，别绕着写
@@ -278,6 +278,7 @@ export function apply(ctx) {
     dislikes: (qq) => use('memory')?.dislikes?.(qq) ?? false,
     onMemoryCommand: (msg, text) => use('memory')?.handleCommand?.(msg, text),
     // QQ 里的主人命令（模块加的命令优先）
+    isCommandText: (text) => Boolean(parseCommand(text, mods.commands())),
     onCommand: async (msg) => {
       const cmd = parseCommand(msg.text, mods.commands())
       if (!cmd) return null
@@ -510,7 +511,7 @@ export function apply(ctx) {
     listModels,
     defaultModel: () => defaultModel(ctx, { model: {} }),
     http: { body: readBody, raw: readRaw, query, send },
-    personas: { list: listPersonas, read: readPersona, current: () => currentPersonaText(cfg.persona.current) },
+    personas: { list: listPersonas, read: readPersona, current: () => currentPersonaText(resolvePersonaId(cfg)), today: () => todayPersona(cfg) },
     getConfig, setConfig,
   }
   mods = createModules({ ctx, core, getConfig, setConfig, logger, version: VERSION, builtins: BUILTINS })
@@ -1277,7 +1278,18 @@ export function apply(ctx) {
   })
 
   // 人格
-  route('/personas', async () => ({ ok: true, list: listPersonas(), current: cfg.persona.current }))
+  route('/personas', async () => ({ ok: true, list: listPersonas(), current: cfg.persona.current, ...todayPersona(cfg) }))
+  // 今天是谁（每日随机人格开着时，id/name 就是当天抽到的那个）
+  route('/persona/today', async () => ({ ok: true, ...todayPersona(cfg) }))
+  // 开/关每日随机，或改轮换池：{ daily: true|false, pool: ['id', ...] }
+  route('/persona/daily', async (req) => {
+    const b = await readBody(req)
+    const daily = typeof b.daily === 'boolean' ? b.daily : cfg.persona.daily
+    const pool = Array.isArray(b.pool) ? b.pool.map((x) => String(x)).filter(Boolean) : cfg.persona.pool
+    setConfig({ ...cfg, persona: { ...cfg.persona, daily, pool } })
+    log.info(`每日随机人格 → ${daily ? '开' : '关'}${pool.length ? '，池子=' + pool.join(',') : ''}`)
+    return { ok: true, ...todayPersona(getConfig()) }
+  })
   route('/persona/get', async (req) => {
     const p = readPersona(query(req).id)
     return p ? { ok: true, persona: p } : { ok: false, message: '没有这个人格' }
@@ -1296,9 +1308,10 @@ export function apply(ctx) {
   route('/persona/use', async (req) => {
     const b = await readBody(req)
     if (!readPersona(b.id)) return { ok: false, message: '没有这个人格' }
-    setConfig({ ...cfg, persona: { current: b.id } })
-    log.info(`切换人格 → ${b.id}`)
-    return { ok: true, current: b.id, message: '切换好了，下一轮回复起生效' }
+    // 手动指定 = 固定下来，同时关掉每日随机，否则当天随机会盖掉手动选的那个
+    setConfig({ ...cfg, persona: { ...cfg.persona, current: b.id, daily: false } })
+    log.info(`切换人格 → ${b.id}（每日随机已关）`)
+    return { ok: true, current: b.id, daily: false, message: '切换好了，下一轮回复起生效（每日随机人格已关）' }
   })
   // 人格页「AI 润色」：只改面板上这一节的文字，不保存；用不用由主人在面板里选
   route('/persona/polish', async (req) => {
